@@ -333,6 +333,9 @@ public class RedissonLock extends RedissonExpirable implements RLock {
                 long current = System.currentTimeMillis();
                 RedissonLockEntry entry = ENTRIES.get(getEntryName());
 
+                // 使用锁的生存时间和锁持有时间中的最小值
+                // 感觉此处仅仅是为了等待而已,减少了while(true)循环的次数
+                //  this.latch = new Semaphore(0);
                 if (ttl >= 0 && ttl < time) {
                     entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
