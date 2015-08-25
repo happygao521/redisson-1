@@ -295,7 +295,6 @@ public class RedissonLock extends RedissonExpirable implements RLock {
                 id.toString() + "-" + Thread.currentThread().getId(), internalLockLeaseTime); // argvs
     }
 
-    // 使用double check
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
         long time = unit.toMillis(waitTime);
         Long ttl;
