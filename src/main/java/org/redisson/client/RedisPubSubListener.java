@@ -17,6 +17,7 @@ package org.redisson.client;
 
 import org.redisson.client.protocol.pubsub.PubSubType;
 
+// redis发布订阅监听器
 public interface RedisPubSubListener<V> {
 
     boolean onStatus(PubSubType type, String channel);

@@ -107,6 +107,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         }
     }
 
+    //利用redis的pubsub提供一个通知机制来减少不断的重试.
     private Future<Boolean> subscribe() {
         Promise<Boolean> promise = aquire();
         if (promise != null) {
@@ -224,6 +225,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         return tryLockInner() == null;
     }
 
+    // 返回null标识获取到锁
     private Long tryLockInner() {
         Long ttlRemaining = tryLockInner(LOCK_EXPIRATION_INTERVAL_SECONDS, TimeUnit.SECONDS);
         // lock acquired
@@ -308,7 +310,14 @@ public class RedissonLock extends RedissonExpirable implements RLock {
             return true;
         }
 
-        // 在指定的之间内等待操作完成???
+        //subscribe这个方法代码有点多, Redisson通过netty来和redis通讯, 然后subscribe返回的是一个Future类型,
+        //Future的awaitUninterruptibly()调用会阻塞, 然后Redisson通过Redis的pubsub来监听unlock的topic(getChannelName())
+        //当解锁时, 会向名为 getChannelName() 的topic来发送解锁消息("0")
+        //而这里 subscribe() 中监听这个topic, 在订阅成功时就会唤醒阻塞在awaitUninterruptibly()的方法.
+        //所以线程在这里只会阻塞很短的时间(订阅成功即唤醒, 并不代表已经解锁)
+        //利用redis的pubsub提供一个通知机制来减少不断的重试.
+        // 很多的Redis锁实现都是失败后sleep一定时间后重试, 在锁被占用时间较长时,
+        // 不断的重试是浪费, 而sleep也会导致不必要的时间浪费(在sleep期间可能已经解锁了), sleep时间太长, 时间浪费, 太短, 重试次数会增加~~~.
         if (!subscribe().awaitUninterruptibly(time, TimeUnit.MILLISECONDS)) {
             return false;
         }
@@ -331,12 +340,13 @@ public class RedissonLock extends RedissonExpirable implements RLock {
 
                 // waiting for message
                 long current = System.currentTimeMillis();
-                RedissonLockEntry entry = ENTRIES.get(getEntryName());
 
-                // 使用锁的生存时间和锁持有时间中的最小值
-                // 感觉此处仅仅是为了等待而已,减少了while(true)循环的次数
-                //  this.latch = new Semaphore(0);
+                // 这里才是真正的等待解锁消息, 收到解锁消息, 就唤醒, 然后尝试获取锁, 成功返回, 失败则阻塞在tryAcquire().
+                // 收到订阅成功消息, 则唤醒阻塞上面的subscribe().awaitUninterruptibly();
+                // 收到解锁消息, 则唤醒阻塞在下面的entry.getLatch().tryAcquire();
+                RedissonLockEntry entry = ENTRIES.get(getEntryName());
                 if (ttl >= 0 && ttl < time) {
+                    // 使用锁的生存时间和锁持有时间中的最小值
                     entry.getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
                 } else {
                     entry.getLatch().tryAcquire(time, TimeUnit.MILLISECONDS);
@@ -347,6 +357,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
             }
             return true;
         } finally {
+            ///加锁成功或异常,解除订阅
             unsubscribe();
         }
     }
@@ -360,25 +371,26 @@ public class RedissonLock extends RedissonExpirable implements RLock {
     public void unlock() {
         Boolean opStatus = commandExecutor.evalWrite(getName(), RedisCommands.EVAL_BOOLEAN,
                 "local v = redis.call('get', KEYS[1]); " +
-                                "if (v == false) then " +
-                                "  redis.call('publish', ARGV[4], ARGV[2]); " +
+                                "if (v == false) then " +  // 锁已经释放
+                                "  redis.call('publish', ARGV[4], ARGV[2]); " + // 对外通知
                                 "  return true; " +
                                 "else " +
                                 "  local o = cjson.decode(v); " +
-                                "  if (o['o'] == ARGV[1]) then " +
-                                "    o['c'] = o['c'] - 1; " +
-                                "    if (o['c'] > 0) then " +
-                                "      redis.call('set', KEYS[1], cjson.encode(o), 'px', ARGV[3]); " +
-                                "      return false;"+
+                                "  if (o['o'] == ARGV[1]) then " + // 判断是否是锁的持有线程来释放锁
+                                "    o['c'] = o['c'] - 1; " +  // 减少线程持有锁的次数
+                                "    if (o['c'] > 0) then " + // 如果线程依旧持有锁
+                                "      redis.call('set', KEYS[1], cjson.encode(o), 'px', ARGV[3]); " + // 设置锁的过期时间为30s
+                                "      return false;"+ // 锁释放失败
                                 "    else " +
-                                "      redis.call('del', KEYS[1]);" +
-                                "      redis.call('publish', ARGV[4], ARGV[2]); " +
+                                "      redis.call('del', KEYS[1]);" + // 如果线程已经不在持有锁了则删除key
+                                "      redis.call('publish', ARGV[4], ARGV[2]); " + // 对外通知
                                 "      return true;"+
                                 "    end" +
                                 "  end;" +
                                 "  return nil; " +
                                 "end",
-                        Collections.<Object>singletonList(getName()), id.toString() + "-" + Thread.currentThread().getId(), unlockMessage, internalLockLeaseTime, getChannelName());
+                        Collections.<Object>singletonList(getName()),
+                id.toString() + "-" + Thread.currentThread().getId(), unlockMessage, internalLockLeaseTime, getChannelName());
         if (opStatus == null) {
             throw new IllegalStateException("Can't unlock lock Current id: "
                     + id + " thread-id: " + Thread.currentThread().getId());
@@ -429,6 +441,7 @@ public class RedissonLock extends RedissonExpirable implements RLock {
         return opStatus;
     }
 
+    // 获取当前线程只有指定锁的个数(也就是重入的次数)
     @Override
     public int getHoldCount() {
         Long opStatus = commandExecutor.evalRead(getName(), RedisCommands.EVAL_INTEGER,
